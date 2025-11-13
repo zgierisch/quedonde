@@ -30,7 +30,7 @@ Features:
 
 import os, sys, sqlite3, difflib, hashlib, pickle, json, time, re
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 
@@ -206,9 +206,9 @@ def index_repo(conn, root="."):
 
 
 
-def cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, lines_flag):
+def cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, lines_flag, title_filter):
 
-    data = f"{pattern}:{mode}:{fuzzy}:{context}:{json_mode}:{paths_only}:{lines_flag}"
+    data = f"{pattern}:{mode}:{fuzzy}:{context}:{json_mode}:{paths_only}:{lines_flag}:{title_filter or ''}"
 
     return hashlib.md5(data.encode()).hexdigest()
 
@@ -336,15 +336,13 @@ def build_line_regex(query: str):
         return None
 
 
-def find_line_numbers(path: str, regex, fallback: Optional[str]) -> List[int]:
+def collect_line_info(path: str, regex, fallback: Optional[str], context: int) -> Tuple[List[int], str]:
 
     numbers: List[int] = []
 
     if regex is None and not fallback:
 
-        return numbers
-
-    seen = set()
+        return numbers, ""
 
     fallback_lower = fallback.lower() if fallback else None
 
@@ -352,29 +350,65 @@ def find_line_numbers(path: str, regex, fallback: Optional[str]) -> List[int]:
 
         with open(path, "r", errors="ignore") as fh:
 
-            for idx, line in enumerate(fh, start=1):
-
-                matched = False
-
-                if regex and regex.search(line):
-
-                    matched = True
-
-                elif fallback_lower and fallback_lower in line.lower():
-
-                    matched = True
-
-                if matched and idx not in seen:
-
-                    seen.add(idx)
-
-                    numbers.append(idx)
+            lines = fh.readlines()
 
     except Exception:
 
-        pass
+        return numbers, ""
 
-    return numbers
+    seen = set()
+
+    for idx, line in enumerate(lines, start=1):
+
+        matched = False
+
+        if regex and regex.search(line):
+
+            matched = True
+
+        elif fallback_lower and fallback_lower in line.lower():
+
+            matched = True
+
+        if matched and idx not in seen:
+
+            seen.add(idx)
+
+            numbers.append(idx)
+
+    if not numbers:
+
+        return numbers, ""
+
+    max_line = len(lines)
+
+    intervals: List[List[int]] = []
+
+    context = max(context, 0)
+
+    for n in numbers:
+
+        start = max(1, n - context)
+
+        end = min(max_line, n + context)
+
+        if intervals and start <= intervals[-1][1] + 1:
+
+            intervals[-1][1] = max(intervals[-1][1], end)
+
+        else:
+
+            intervals.append([start, end])
+
+    blocks = []
+
+    for start, end in intervals:
+
+        blocks.append("".join(lines[start - 1:end]))
+
+    snippet = "\n...\n".join(blocks).rstrip("\n")
+
+    return numbers, snippet
 
 
 def build_match_query(query: str, search_content: bool, search_name: bool) -> str:
@@ -429,7 +463,9 @@ def search_repo(
 
     collect_lines: bool = False,
 
-    limit: int = 200
+    limit: int = 200,
+
+    title_filters: Optional[List[str]] = None
 
 ) -> List[Dict]:
 
@@ -449,15 +485,19 @@ def search_repo(
 
     results = []
 
-    collect_line_numbers = collect_lines and content and not name and not fuzzy
+    title_terms = [t.lower() for t in title_filters if t] if title_filters else []
 
-    if collect_line_numbers and _needs_raw_fts(query):
+    requires_raw = _needs_raw_fts(query)
 
-        collect_line_numbers = False
+    simple_content_search = content and not name and not fuzzy and not requires_raw
 
-    line_regex = build_line_regex(query) if collect_line_numbers else None
+    collect_line_numbers = collect_lines and simple_content_search
 
-    fallback_substring: Optional[str] = query.strip() if collect_line_numbers else None
+    collect_context = context > 0 and simple_content_search
+
+    line_regex = build_line_regex(query) if (collect_line_numbers or collect_context) else None
+
+    fallback_substring: Optional[str] = query.strip() if (collect_line_numbers or collect_context) else None
 
     if fallback_substring == "":
 
@@ -502,13 +542,57 @@ def search_repo(
 
     for path, snippet in rows:
 
-        snippet_with_context = read_context_lines(path, snippet, context)
+        if title_terms:
+
+            path_lower = path.lower()
+
+            if not all(term in path_lower for term in title_terms):
+
+                continue
+
+        line_numbers: List[int] = []
+
+        collected_snippet = ""
+
+        if (collect_line_numbers or collect_context) and (line_regex or fallback_substring):
+
+            line_numbers, collected_snippet = collect_line_info(
+
+                path,
+
+                line_regex,
+
+                fallback_substring,
+
+                max(context, 0)
+
+            )
+
+        snippet_with_context = snippet
+
+        if collect_context:
+
+            if collected_snippet:
+
+                snippet_with_context = collected_snippet
+
+            else:
+
+                snippet_with_context = read_context_lines(path, snippet, context)
+
+        elif context > 0:
+
+            snippet_with_context = read_context_lines(path, snippet, context)
+
+        elif collected_snippet:
+
+            snippet_with_context = collected_snippet
 
         record = {"path": path, "snippet": snippet_with_context}
 
         if collect_line_numbers:
 
-            record["lines"] = find_line_numbers(path, line_regex, fallback_substring)
+            record["lines"] = line_numbers
 
         output.append(record)
 
@@ -592,63 +676,83 @@ def main():
 
     context = 0
 
-    if "--context" in sys.argv:
-
-        try:
-
-            idx = sys.argv.index("--context")
-
-            context = int(sys.argv[idx + 1])
-
-        except Exception:
-
-            print("Invalid --context usage", file=sys.stderr)
-
-            return
-
-
+    title_filters: List[str] = []
 
     args = sys.argv[1:]
 
-    pattern_parts = []
+    pattern_parts: List[str] = []
 
-    skip_next = False
+    i = 0
 
-    for arg in args:
+    while i < len(args):
 
-        if skip_next:
-
-            skip_next = False
-
-            continue
+        arg = args[i]
 
         if arg == "--context":
 
-            skip_next = True
+            if i + 1 >= len(args):
+
+                print("Invalid --context usage", file=sys.stderr)
+
+                return
+
+            try:
+
+                context = int(args[i + 1])
+
+            except Exception:
+
+                print("Invalid --context usage", file=sys.stderr)
+
+                return
+
+            i += 2
+
+            continue
+
+        if arg == "--title":
+
+            if i + 1 >= len(args):
+
+                print("Invalid --title usage", file=sys.stderr)
+
+                return
+
+            title_filters.append(args[i + 1])
+
+            i += 2
 
             continue
 
         if arg in {"--json", "--name", "--content", "--fuzzy", "--paths", "--lines"}:
 
+            i += 1
+
             continue
 
         if arg.startswith("--"):
+
+            i += 1
 
             continue
 
         pattern_parts.append(arg)
 
+        i += 1
 
 
-    if not pattern_parts:
 
-        print("Usage: python quedonde.py [--json|--paths] [--name|--content|--fuzzy] [--context N] <pattern>", file=sys.stderr)
+    if not pattern_parts and not title_filters:
+
+        print("Usage: python quedonde.py [--json|--paths] [--name|--content|--fuzzy] [--context N] [--title TEXT] <pattern>", file=sys.stderr)
 
         return
 
 
 
     pattern = " ".join(pattern_parts)
+
+    title_filter_key = "|".join(title_filters)
 
     if show_lines and _needs_raw_fts(pattern):
 
@@ -660,7 +764,7 @@ def main():
 
     cache = load_cache()
 
-    key = cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, show_lines)
+    key = cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, show_lines, title_filter_key)
 
     if key in cache:
 
@@ -692,7 +796,9 @@ def main():
 
         json_mode=json_mode,
 
-        collect_lines=show_lines
+        collect_lines=show_lines,
+
+        title_filters=title_filters
 
     )
 

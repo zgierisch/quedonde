@@ -23,6 +23,9 @@ python quedonde.py --name "settings.json"
 
 # Fuzzy match with 2 lines of context
 python quedonde.py --fuzzy --context 2 "setup logging"
+
+# Filter by filename and show 3 lines of snippet context
+python quedonde.py --title docs --context 3 "authentication"
 ```
 
 ### CLI flags
@@ -33,6 +36,7 @@ python quedonde.py --fuzzy --context 2 "setup logging"
 - `--fuzzy` — fuzzy-match file names and content.
 - `--context N` — include `N` lines of surrounding context in the text output (ignored for `--paths`).
 - `--lines` — show matching line numbers for content searches (disabled with `--paths`, `--fuzzy`, or advanced FTS syntax).
+- `--title TEXT` — require `TEXT` (case-insensitive) to appear somewhere in the file path; repeat the flag to AND multiple terms together.
 - Multi-word queries (without special operators) are treated as exact phrases; include FTS operators (`OR`, `NEAR`, wildcards, etc.) if you want advanced matching.
 
 ### Piping results
