@@ -28,7 +28,7 @@ Features:
 
 
 
-import os, sys, sqlite3, difflib, hashlib, pickle, json, time
+import os, sys, sqlite3, difflib, hashlib, pickle, json, time, re
 
 from typing import List, Dict
 
@@ -302,6 +302,21 @@ def _needs_raw_fts(query: str) -> bool:
     return False
 
 
+def _normalize_phrase(query: str) -> str:
+
+    tokens = re.findall(r"\w+", query)
+
+    if not tokens:
+
+        return ""
+
+    if len(tokens) == 1:
+
+        return tokens[0]
+
+    return '"' + " ".join(tokens) + '"'
+
+
 def build_match_query(query: str, search_content: bool, search_name: bool) -> str:
 
     stripped = query.strip()
@@ -314,9 +329,11 @@ def build_match_query(query: str, search_content: bool, search_name: bool) -> st
 
         return stripped
 
-    escaped = stripped.replace('"', '""')
+    term = _normalize_phrase(stripped)
 
-    term = f'"{escaped}"' if ' ' in stripped else escaped
+    if not term:
+
+        return stripped
 
     if search_name and not search_content:
 
