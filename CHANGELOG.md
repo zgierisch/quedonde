@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [2025-11-13]
+
 ### Added
 - `--lines` flag to include matching line numbers for content searches.
 - `--title` flag to filter results by path segments while keeping content searches intact.
