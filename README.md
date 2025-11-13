@@ -26,12 +26,15 @@ python quedonde.py --fuzzy --context 2 "setup logging"
 
 # Filter by filename and show 3 lines of snippet context
 python quedonde.py --title docs --context 3 "authentication"
+
+# Limit search results to a single path while emitting paths-only output
+python quedonde.py --content --paths --title data/locations/preset_locations.json "phoenix"
 ```
 
 ### CLI flags
 - `index` — rebuild the index after changes.
 - `--json` — emit indented JSON (default output when `--paths` is not set).
-- `--paths` — print only matching file paths (one per line) so you can pipe into other commands.
+- `--paths` — print only matching file paths (one per line) so you can pipe into other commands. This flag **does not** narrow which files are searched; combine it with `--title` or `--name` if you need to scope the search.
 - `--name` / `--content` — limit the search scope.
 - `--fuzzy` — fuzzy-match file names and content.
 - `--context N` — include `N` lines of surrounding context in the text output (ignored for `--paths`).
