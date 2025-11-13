@@ -7,3 +7,4 @@
 
 ### Fixed
 - Normalize content queries containing punctuation so SQLite FTS no longer throws syntax errors.
+- Handle trailing parentheses in content queries without triggering FTS syntax errors.

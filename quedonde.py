@@ -291,7 +291,7 @@ def _needs_raw_fts(query: str) -> bool:
 
         return True
 
-    if any(ch in query for ch in ('"', '*', '(', ')', '~', '^')):
+    if any(ch in query for ch in ('"', '*', '~', '^')):
 
         return True
 
