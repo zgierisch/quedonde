@@ -1,2 +1,4 @@
 .code_index.sqlite
 .code_index.cache
+build/
+dist/

@@ -30,7 +30,7 @@ Features:
 
 import os, sys, sqlite3, difflib, hashlib, pickle, json, time, re
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 
 
@@ -206,9 +206,9 @@ def index_repo(conn, root="."):
 
 
 
-def cache_key(pattern, mode, fuzzy, context, json_mode, paths_only):
+def cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, lines_flag):
 
-    data = f"{pattern}:{mode}:{fuzzy}:{context}:{json_mode}:{paths_only}"
+    data = f"{pattern}:{mode}:{fuzzy}:{context}:{json_mode}:{paths_only}:{lines_flag}"
 
     return hashlib.md5(data.encode()).hexdigest()
 
@@ -317,6 +317,66 @@ def _normalize_phrase(query: str) -> str:
     return '"' + " ".join(tokens) + '"'
 
 
+def build_line_regex(query: str):
+
+    tokens = re.findall(r"\w+", query)
+
+    if not tokens:
+
+        return None
+
+    pattern = r"\\b" + r"\\W+".join(re.escape(tok) for tok in tokens) + r"\\b"
+
+    try:
+
+        return re.compile(pattern, re.IGNORECASE)
+
+    except re.error:
+
+        return None
+
+
+def find_line_numbers(path: str, regex, fallback: Optional[str]) -> List[int]:
+
+    numbers: List[int] = []
+
+    if regex is None and not fallback:
+
+        return numbers
+
+    seen = set()
+
+    fallback_lower = fallback.lower() if fallback else None
+
+    try:
+
+        with open(path, "r", errors="ignore") as fh:
+
+            for idx, line in enumerate(fh, start=1):
+
+                matched = False
+
+                if regex and regex.search(line):
+
+                    matched = True
+
+                elif fallback_lower and fallback_lower in line.lower():
+
+                    matched = True
+
+                if matched and idx not in seen:
+
+                    seen.add(idx)
+
+                    numbers.append(idx)
+
+    except Exception:
+
+        pass
+
+    return numbers
+
+
 def build_match_query(query: str, search_content: bool, search_name: bool) -> str:
 
     stripped = query.strip()
@@ -367,6 +427,8 @@ def search_repo(
 
     json_mode: bool = True,
 
+    collect_lines: bool = False,
+
     limit: int = 200
 
 ) -> List[Dict]:
@@ -387,6 +449,19 @@ def search_repo(
 
     results = []
 
+    collect_line_numbers = collect_lines and content and not name and not fuzzy
+
+    if collect_line_numbers and _needs_raw_fts(query):
+
+        collect_line_numbers = False
+
+    line_regex = build_line_regex(query) if collect_line_numbers else None
+
+    fallback_substring: Optional[str] = query.strip() if collect_line_numbers else None
+
+    if fallback_substring == "":
+
+        fallback_substring = None
 
 
     if fuzzy:
@@ -429,7 +504,13 @@ def search_repo(
 
         snippet_with_context = read_context_lines(path, snippet, context)
 
-        output.append({"path": path, "snippet": snippet_with_context})
+        record = {"path": path, "snippet": snippet_with_context}
+
+        if collect_line_numbers:
+
+            record["lines"] = find_line_numbers(path, line_regex, fallback_substring)
+
+        output.append(record)
 
     return output
 
@@ -471,9 +552,23 @@ def main():
 
     paths_only = "--paths" in sys.argv
 
+    show_lines = "--lines" in sys.argv
+
     if paths_only:
 
         json_mode = False
+
+        if show_lines:
+
+            print("[warn] --lines ignored when --paths is set", file=sys.stderr)
+
+            show_lines = False
+
+    if show_lines and fuzzy:
+
+        print("[warn] --lines is not supported with --fuzzy", file=sys.stderr)
+
+        show_lines = False
 
 
 
@@ -486,6 +581,12 @@ def main():
     elif "--content" in sys.argv:
 
         mode = "content"
+
+    if show_lines and mode == "name":
+
+        print("[warn] --lines only applies to content searches", file=sys.stderr)
+
+        show_lines = False
 
 
 
@@ -527,7 +628,7 @@ def main():
 
             continue
 
-        if arg in {"--json", "--name", "--content", "--fuzzy", "--paths"}:
+        if arg in {"--json", "--name", "--content", "--fuzzy", "--paths", "--lines"}:
 
             continue
 
@@ -549,11 +650,17 @@ def main():
 
     pattern = " ".join(pattern_parts)
 
+    if show_lines and _needs_raw_fts(pattern):
+
+        print("[warn] --lines ignored for advanced FTS queries", file=sys.stderr)
+
+        show_lines = False
+
 
 
     cache = load_cache()
 
-    key = cache_key(pattern, mode, fuzzy, context, json_mode, paths_only)
+    key = cache_key(pattern, mode, fuzzy, context, json_mode, paths_only, show_lines)
 
     if key in cache:
 
@@ -583,7 +690,9 @@ def main():
 
         context=context,
 
-        json_mode=json_mode
+        json_mode=json_mode,
+
+        collect_lines=show_lines
 
     )
 
@@ -600,8 +709,23 @@ def main():
         output = json.dumps(results, indent=2)
 
     else:
+        lines_formatted = []
 
-        output = "\n".join([f"{r['path']}:\n{r['snippet']}" for r in results])
+        for r in results:
+
+            suffix = ""
+
+            if show_lines:
+
+                line_numbers = r.get("lines") or []
+
+                if line_numbers:
+
+                    suffix = ":" + ",".join(str(num) for num in line_numbers)
+
+            lines_formatted.append(f"{r['path']}{suffix}:\n{r['snippet']}")
+
+        output = "\n".join(lines_formatted)
 
 
 

@@ -32,6 +32,7 @@ python quedonde.py --fuzzy --context 2 "setup logging"
 - `--name` / `--content` — limit the search scope.
 - `--fuzzy` — fuzzy-match file names and content.
 - `--context N` — include `N` lines of surrounding context in the text output (ignored for `--paths`).
+- `--lines` — show matching line numbers for content searches (disabled with `--paths`, `--fuzzy`, or advanced FTS syntax).
 - Multi-word queries (without special operators) are treated as exact phrases; include FTS operators (`OR`, `NEAR`, wildcards, etc.) if you want advanced matching.
 
 ### Piping results
