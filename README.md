@@ -31,6 +31,8 @@ python quedonde.py --title docs --context 3 "authentication"
 python quedonde.py --content --paths --title data/locations/preset_locations.json "phoenix"
 ```
 
+> **Note:** Queries containing FTS operators or punctuation such as colons (`:`), quotes, or wildcards are treated as raw SQLite FTS expressions. When that happens, qualify the column you want to search—e.g., use `content:"Mountain Orientation:"` to match the literal text `Mountain Orientation:` in file contents. Simple phrases without special characters (like `"http client"`) automatically search both filename and content fields.
+
 ### CLI flags
 - `index` — rebuild the index after changes.
 - `--json` — emit indented JSON (default output when `--paths` is not set).
