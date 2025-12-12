@@ -2,3 +2,6 @@
 .code_index.cache
 build/
 dist/
+.venv/
+__pycache__/
+*.pyc
