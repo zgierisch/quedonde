@@ -99,10 +99,10 @@ What each command returns:
 If the tables go stale (or you cloned a repo without the DB), rerun `index`. The CLI warns on `stderr` and returns an empty list until fresh data exists.
 
 ### How intent detection works
-- The `ask` command does **not** run an LLM. Instead, it lower-cases the query, strips helper words (`what`, `is`, `does`, etc.), then matches deterministic keyword patterns documented in [documentation/specs/intent_classifier.md](documentation/specs/intent_classifier.md).
+- The `ask` command does **not** run an LLM. Instead, it lower-cases the query, strips helper words (`what`, `is`, `does`, etc.), then matches deterministic keyword patterns hard-coded in `quedonde.py` (see `_INTENT_RULES`).
 - Phrases like “where is … defined” map to the `find` handler, “who calls …” maps to `callers`, “depends on …” maps to `deps`, and verbs such as “explain”/“tell me about” route to the `explain` aggregator. The first matching rule wins, so unambiguous wording helps.
-- The final meaningful token becomes the candidate symbol; you can force disambiguation with the `symbol:<name>` prefix described in the spec if needed.
-- All rules have regression coverage via [documentation/fixtures/intent/queries.md](documentation/fixtures/intent/queries.md), so you can extend the heuristics and immediately smoke-test new phrases by running `python -m unittest tests.test_intent_classifier`.
+- The final meaningful token becomes the candidate symbol; you can force disambiguation with the `symbol:<name>` prefix if needed.
+- To extend the heuristics, update `_INTENT_RULES` and quickly validate changes by running a few `python quedonde.py ask --json ...` commands (or wire up your own tests) before committing the new patterns.
 
 ## Python API
 All CLI functionality is backed by importable helpers:
@@ -131,7 +131,7 @@ Each helper returns JSON-compatible dictionaries that mirror the CLI output, mak
 
 ## Benchmarking & Performance Evidence
 - `scripts/generate_benchmark_repo.py <dest> --files 10000` – create a deterministic synthetic repo.
-- `python scripts/run_benchmarks.py` – automate repo generation, migrations, multiple `index` runs, warmed structural queries, and Markdown reporting to `documentation/reports/benchmark_results.md`.
+- `python scripts/run_benchmarks.py` – automate repo generation, migrations, multiple `index` runs, warmed structural queries, and Markdown reporting to `documentation/reports/benchmark_results.md` (create that folder locally; it stays untracked).
 
 The reference run used for the 2.0.0 release produced the following metrics (see the report for the full table):
 
@@ -151,4 +151,4 @@ Use the harness whenever you need reproducible, evidence-backed timings before s
 - Structural commands rely on migrations. If you see `[struct] structural tables unavailable`, run `python quedonde.py migrate` followed by `python quedonde.py index`.
 - For CI, call `python quedonde.py diagnose --json` to verify migrations and table counts before running structural tests.
 
-Happy searching! If you run into edge cases or need additional examples, open an issue or extend the tests under `tests/` + `documentation/fixtures/`.
+Happy searching! If you run into edge cases or need additional examples, open an issue and share the command output so we can reproduce it.

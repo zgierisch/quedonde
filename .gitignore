@@ -5,3 +5,7 @@ dist/
 .venv/
 __pycache__/
 *.pyc
+documentation/
+planning/
+tests/
+test_all.py
