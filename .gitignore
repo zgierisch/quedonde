@@ -5,9 +5,10 @@ dist/
 .venv/
 __pycache__/
 *.pyc
-documentation/
+documentation/*
 !documentation/specs/
-!documentation/specs/*.md
+documentation/specs/*
+!documentation/specs/**
 documentation/specs/speculative/
 planning/
 tests/
