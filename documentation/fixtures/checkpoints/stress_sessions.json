@@ -1,0 +1,88 @@
+{
+  "output_dir": "checkpoints/stress",
+  "default_confidence": "medium",
+  "sessions": [
+    {
+      "session_id": "structural_core",
+      "subsystems": ["Structural"],
+      "files": [
+        "quedonde.py"
+      ],
+      "symbols": [
+        "update_structural_data",
+        "index_repo",
+        "clear_structural_records"
+      ],
+      "decisions": [
+        "Keep structural tables lean::fan-out is manageable"
+      ],
+      "questions": [
+        "Should dependencies include annotations?"
+      ],
+      "confidence": "high",
+      "deps_limit": 30
+    },
+    {
+      "session_id": "cli_resume",
+      "subsystems": ["CLI"],
+      "files": [
+        "quedonde.py",
+        "README.md"
+      ],
+      "symbols": [
+        "session_dump_cli",
+        "session_resume_cli",
+        "_revalidate_session_state"
+      ],
+      "decisions": [
+        "Warn on drift::users prefer visibility"
+      ],
+      "questions": [
+        "Should skip-verify be allowed in CI?"
+      ]
+    },
+    {
+      "session_id": "automation_helper",
+      "subsystems": ["Tooling"],
+      "files": [
+        "scripts/session_checkpoint.py",
+        "documentation/guides/session_checkpoint_llm_usage.md"
+      ],
+      "symbols": [
+        "_build_command",
+        "_validate_session",
+        "_resolve_output_path"
+      ],
+      "decisions": [
+        "Batch plan coverage::LLM operators need deterministic configs"
+      ],
+      "questions": [
+        "Add schema validation for prompts?"
+      ],
+      "confidence": "low",
+      "deps_limit": 10,
+      "append": true
+    },
+    {
+      "session_id": "schema_guardrails",
+      "subsystems": ["Schema", "Docs"],
+      "files": [
+        "quedonde.py",
+        "scripts/session_checkpoint.py"
+      ],
+      "symbols": [
+        "session_cli",
+        "_write_session_output",
+        "_parse_decision_entry"
+      ],
+      "decisions": [
+        "Never persist raw code::validators enforce length limits"
+      ],
+      "questions": [
+        "Need migration guide when schema_version bumps?"
+      ],
+      "confidence": "medium",
+      "force": true
+    }
+  ]
+}

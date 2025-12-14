@@ -233,4 +233,3 @@ def _ensure(condition: bool, message: str) -> None:
 
 def new_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-*** End of File***
