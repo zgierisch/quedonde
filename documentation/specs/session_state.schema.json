@@ -61,7 +61,7 @@
       "minProperties": 1,
       "additionalProperties": {
         "type": "object",
-        "required": ["kind", "role", "evidence"],
+        "required": ["kind", "role", "evidence", "source_paths"],
         "additionalProperties": false,
         "properties": {
           "kind": {
@@ -73,6 +73,16 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 64
+          },
+          "source_paths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
           },
           "evidence": {
             "type": "object",

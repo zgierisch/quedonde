@@ -38,11 +38,15 @@ class SymbolSummary:
     kind: str
     role: str
     evidence: Evidence
+    source_paths: List[str] = field(default_factory=list)
 
     def validate(self, symbol_name: str) -> None:
         _ensure(symbol_name and len(symbol_name) <= MAX_SYMBOL_NAME, "invalid symbol name")
         _ensure(self.kind and len(self.kind) <= 64, "invalid symbol kind")
         _ensure(self.role and len(self.role) <= 64, "invalid role")
+        _ensure(bool(self.source_paths), "each symbol summary requires at least one source path")
+        for path in self.source_paths:
+            _ensure(path and len(path) <= 256, "source paths must be <= 256 chars")
         self.evidence.validate()
 
 
@@ -140,6 +144,7 @@ def session_state_from_dict(payload: Mapping[str, Any]) -> SessionState:
                 fan_out=int(evidence.get("fan_out", 0)),
                 annotations=list(evidence.get("annotations") or []),
             ),
+            source_paths=list(summary.get("source_paths") or []),
         )
     dependencies = [
         DependencyRecord(
@@ -190,6 +195,7 @@ def session_state_to_dict(state: SessionState) -> Dict[str, Any]:
                     "fan_out": summary.evidence.fan_out,
                     "annotations": list(summary.evidence.annotations),
                 },
+                "source_paths": list(summary.source_paths),
             }
             for name, summary in state.symbols.items()
         },

@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No changes yet._
+### Added
+- Session checkpoint workflow documentation: README now details the CLI flow, guardrails, automation hooks, and links to a new LLM playbook (`documentation/guides/session_checkpoint_llm_usage.md`).
+- Batch tooling for checkpoints: `scripts/session_checkpoint.py` fans out multiple `session dump` runs from a JSON plan, and `documentation/fixtures/checkpoints/sample_sessions.json` demonstrates the format.
 
 ## [2.0.0] - 2025-12-12
 

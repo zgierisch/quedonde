@@ -144,6 +144,77 @@ The reference run used for the 2.0.0 release produced the following metrics (see
 
 Use the harness whenever you need reproducible, evidence-backed timings before shipping changes.
 
+## Session State Checkpoints
+For long-running structural investigations with an LLM, dump derived conclusions into a checkpoint you can re-ingest later.
+
+### CLI workflow
+```powershell
+# Create a checkpoint (symbols + structural evidence pulled automatically)
+python quedonde.py session dump `
+	--session-id climate_stage2 `
+	--subsystem Climate `
+	--file src/climate/controller.py `
+	--symbol ClimateController `
+	--symbol MoistureBridge `
+	--decision "Delay refactor::still high fan-in" `
+	--question "Is MoistureBridge still needed post-uplift?" `
+	--output checkpoints/climate.json
+
+# Append another subsystem snapshot into the same file
+python quedonde.py session dump --session-id atmos_recon --append --output checkpoints/climate.json ...
+
+# Resume from a saved checkpoint, showing the human-readable summary
+python quedonde.py session resume --input checkpoints/climate.json --session-id climate_stage2
+
+# Emit raw JSON for tooling/LLM consumption
+python quedonde.py session resume --input checkpoints/climate.json --session-id climate_stage2 --json
+
+# Skip drift verification (not recommended)
+python quedonde.py session resume --input checkpoints/climate.json --skip-verify
+```
+
+1. **Scope the session** – repeat `--subsystem`, `--file`, and `--symbol` to define what you touched. The CLI collects fan-in/out counts, annotations, and dependent edges directly from the SQLite structural tables.
+2. **Capture narrative context** – add `--decision` entries in `decision::reason` format and `--question` flags for any open issues so they stay tied to the evidence.
+3. **Store locally** – use `--output` (plus `--append` or `--force`) to control how checkpoints land under `checkpoints/` or another ignored folder.
+4. **Rehydrate later** – `session resume` revalidates the snapshot against the live database and prints either JSON (`--json`) or a human-readable digest. Investigate any warnings before trusting the data.
+
+### Guardrails & limits
+- Source provenance: every symbol stores up to five `source_paths`; if any disappear, `session resume` emits a warning so you can re-index or adjust scope.
+- Drift detection: structural version mismatches, fan-in/out deltas, and missing symbols surface on `stderr`. Only pass `--skip-verify` for rehearsed CI workflows.
+- Data hygiene: validators reject raw code snippets longer than 120 characters, forcing you to store reasoning rather than source dumps.
+- Local storage: checkpoints stay in ignored directories, so promote them manually only if your security model allows sharing.
+- Schema alignment: the format is defined in [documentation/specs/session_state_checkpointing.md](documentation/specs/session_state_checkpointing.md); bump the schema version and regenerate checkpoints whenever that file changes.
+
+### Batch automation
+Define multiple sessions in a small JSON plan and let `scripts/session_checkpoint.py` fan them out:
+
+```json
+{
+	"output_dir": "checkpoints",
+	"sessions": [
+		{
+			"session_id": "climate_stage2",
+			"subsystems": ["Climate"],
+			"files": ["src/climate/controller.py"],
+			"symbols": ["ClimateController", "MoistureBridge"],
+			"decisions": ["Delay refactor::still high fan-in"],
+			"questions": ["Is MoistureBridge still needed post-uplift?"]
+		}
+	]
+}
+```
+
+```powershell
+python scripts/session_checkpoint.py --config checkpoints/climate_plan.json
+```
+
+The helper expands each entry into `session dump` invocations, applies consistent dependency limits, and respects per-session `append`/`force` settings.
+
+### Working with LLM copilots
+- Point operators to [documentation/guides/session_checkpoint_llm_usage.md](documentation/guides/session_checkpoint_llm_usage.md) for example prompts and collaboration etiquette.
+- Share the sanitized JSON alongside any warnings emitted during `session resume` so the LLM knows whether it is looking at fresh or potentially stale evidence.
+- When in doubt, regenerate the checkpoint after re-running `python quedonde.py index` and mention the structural version so the assistant can confirm consistency.
+
 ## Tips & Troubleshooting
 - Re-run `python quedonde.py index` after modifying or deleting files; stale entries are purged automatically.
 - `.code_index.cache` stores CLI outputs keyed by query/flags—delete it (or run `index`) to invalidate caches.

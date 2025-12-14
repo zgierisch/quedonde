@@ -1,0 +1,32 @@
+{
+  "output_dir": "checkpoints",
+  "default_confidence": "medium",
+  "sessions": [
+    {
+      "session_id": "climate_stage2",
+      "subsystems": ["Climate"],
+      "files": ["src/climate/controller.py"],
+      "symbols": ["ClimateController", "MoistureBridge"],
+      "decisions": ["Delay refactor::still high fan-in"],
+      "questions": ["Is MoistureBridge still needed post-uplift?"],
+      "confidence": "high",
+      "append": true
+    },
+    {
+      "session_id": "billing_api_audit",
+      "subsystems": ["Billing", "API"],
+      "files": [
+        "services/billing/api.py",
+        "services/billing/pipeline.py"
+      ],
+      "symbols": [
+        "BillingGateway",
+        "ReconciliationJob"
+      ],
+      "decisions": ["Monitor hot path::still too many callers"],
+      "questions": ["Can reconciliation move off the gateway?"],
+      "deps_limit": 15,
+      "force": true
+    }
+  ]
+}

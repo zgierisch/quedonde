@@ -7,6 +7,12 @@ __pycache__/
 *.pyc
 documentation/*
 !documentation/specs/
+!documentation/guides/
+!documentation/guides/**
+!documentation/fixtures/
+documentation/fixtures/*
+!documentation/fixtures/checkpoints/
+!documentation/fixtures/checkpoints/**
 documentation/specs/*
 !documentation/specs/**
 documentation/specs/speculative/
