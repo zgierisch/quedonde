@@ -6,6 +6,9 @@ dist/
 __pycache__/
 *.pyc
 documentation/
+!documentation/specs/
+!documentation/specs/*.md
+documentation/specs/speculative/
 planning/
 tests/
 test_all.py
