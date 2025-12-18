@@ -32,24 +32,410 @@ __version__ = "2.0.0"
 
 
 
-import os, sys, sqlite3, difflib, hashlib, pickle, json, time, re, bisect, argparse
+import os, sys, sqlite3, difflib, hashlib, pickle, json, time, re, bisect, fnmatch
 from pathlib import Path
 
 from typing import List, Dict, Optional, Tuple, Callable, Set
 
-from session_state import (
-    CONFIDENCE_LEVELS,
-    DecisionRecord,
-    DependencyRecord,
-    Evidence,
-    SessionScope,
-    SessionState,
-    SessionStateValidationError,
-    SymbolSummary,
-    new_timestamp,
-    session_state_from_dict,
-    session_state_to_dict,
-)
+_SESSION_STATE_TEMPLATE = r'''"""Session state checkpoint schema helpers."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Set
+
+SCHEMA_VERSION = "1.0"
+ALLOWED_RELATIONS = {"calls", "imports", "includes", "references", "annotates"}
+CONFIDENCE_LEVELS = {"low", "medium", "high"}
+MAX_TEXT_FIELD_LENGTH = 240
+MAX_QUESTION_LENGTH = 200
+MAX_SYMBOL_NAME = 128
+CONTEXT_LEVELS = {0, 1, 2, 3}
+CONTEXT_HISTORY_FILE = Path(".quedonde_context_history.json")
+MAX_SOURCE_PATHS = 5
+MIN_SESSION_ID_LENGTH = 3
+
+
+class SessionStateValidationError(ValueError):
+    """Raised when a checkpoint payload violates the schema."""
+
+
+@dataclass
+class Evidence:
+    fan_in: int
+    fan_out: int
+    annotations: List[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        _ensure(self.fan_in >= 0, "fan_in must be non-negative")
+        _ensure(self.fan_out >= 0, "fan_out must be non-negative")
+        for value in self.annotations:
+            _ensure(bool(value) and len(value) <= 64, "annotation entries must be <= 64 chars")
+
+
+@dataclass
+class SymbolSummary:
+    kind: str
+    role: str
+    evidence: Evidence
+    source_paths: List[str] = field(default_factory=list)
+    context: Optional["ContextBookmark"] = None
+
+    def validate(self, symbol_name: str) -> None:
+        _ensure(bool(symbol_name) and len(symbol_name) <= MAX_SYMBOL_NAME, "invalid symbol name")
+        _ensure(bool(self.kind) and len(self.kind) <= 64, "invalid symbol kind")
+        _ensure(bool(self.role) and len(self.role) <= 64, "invalid role")
+        _ensure(bool(self.source_paths), "each symbol summary requires at least one source path")
+        _ensure(len(self.source_paths) <= MAX_SOURCE_PATHS, "source_paths must contain at most five entries")
+        for path in self.source_paths:
+            _ensure(bool(path) and len(path) <= 256, "source paths must be <= 256 chars")
+        self.evidence.validate()
+        if self.context:
+            self.context.validate()
+
+
+@dataclass
+class ContextBookmark:
+    level: int
+    status: str
+    timestamp: str
+
+    def validate(self) -> None:
+        _ensure(self.level in CONTEXT_LEVELS, "context level must be 0-3")
+        _ensure(_valid_text(self.status, 64), "context status invalid")
+        _ensure(_is_iso_timestamp(self.timestamp), "context timestamp invalid")
+
+
+@dataclass
+class DependencyRecord:
+    src: str
+    relation: str
+    dst: str
+
+    def validate(self) -> None:
+        for value in (self.src, self.dst):
+            _ensure(bool(value) and len(value) <= MAX_SYMBOL_NAME, "dependency endpoints required")
+        _ensure(self.relation in ALLOWED_RELATIONS, f"relation must be one of {sorted(ALLOWED_RELATIONS)}")
+
+
+@dataclass
+class DecisionRecord:
+    decision: str
+    reason: str
+
+    def validate(self) -> None:
+        _ensure(_valid_text(self.decision), "decision text invalid")
+        _ensure(_valid_text(self.reason), "reason text invalid")
+
+
+def _valid_text(value: str, limit: int = MAX_TEXT_FIELD_LENGTH, *, min_length: int = 1) -> bool:
+    return bool(value) and min_length <= len(value) <= limit and "\n" not in value and "\r" not in value
+
+
+@dataclass
+class SessionScope:
+    subsystems: List[str]
+    files: List[str]
+
+    def validate(self) -> None:
+        _ensure(bool(self.subsystems), "scope.subsystems must not be empty")
+        _ensure(bool(self.files), "scope.files must not be empty")
+        for entry in self.subsystems:
+            _ensure(bool(entry) and len(entry) <= 64, "subsystem entries must be <= 64 chars")
+        for entry in self.files:
+            _ensure(bool(entry) and len(entry) <= 256, "file paths must be <= 256 chars")
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    timestamp: str
+    structural_version: str
+    scope: SessionScope
+    symbols: Dict[str, SymbolSummary]
+    confidence: str
+    schema_version: str = SCHEMA_VERSION
+    dependencies: List[DependencyRecord] = field(default_factory=list)
+    decisions: List[DecisionRecord] = field(default_factory=list)
+    open_questions: List[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        _ensure(self.schema_version == SCHEMA_VERSION, f"schema_version must be {SCHEMA_VERSION}")
+        _ensure(
+            _valid_text(self.session_id, 128, min_length=MIN_SESSION_ID_LENGTH),
+            f"session_id must be at least {MIN_SESSION_ID_LENGTH} chars",
+        )
+        _ensure(self.confidence in CONFIDENCE_LEVELS, "confidence must be low/medium/high")
+        _ensure(bool(self.structural_version), "structural_version required")
+        _ensure(_is_iso_timestamp(self.timestamp), "timestamp must be RFC3339/ISO")
+        self.scope.validate()
+        _ensure(bool(self.symbols), "symbols map must not be empty")
+        for name, summary in self.symbols.items():
+            summary.validate(name)
+        for dep in self.dependencies:
+            dep.validate()
+        for decision in self.decisions:
+            decision.validate()
+        for question in self.open_questions:
+            _ensure(_valid_text(question, MAX_QUESTION_LENGTH), "open question text invalid")
+
+
+def load_session_state(path: Path) -> SessionState:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    state = session_state_from_dict(data)
+    attach_context_history(state)
+    return state
+
+
+def session_state_from_dict(payload: Mapping[str, Any]) -> SessionState:
+    payload = _ensure_mapping(payload, "session state payload")
+    _ensure_allowed_keys(
+        payload,
+        {
+            "schema_version",
+            "session_id",
+            "timestamp",
+            "structural_version",
+            "scope",
+            "symbols",
+            "dependencies",
+            "decisions",
+            "open_questions",
+            "confidence",
+        },
+        "session state payload",
+    )
+
+    scope_dict = _ensure_mapping(payload.get("scope") or {}, "scope")
+    _ensure_allowed_keys(scope_dict, {"subsystems", "files"}, "scope")
+    scope = SessionScope(
+        subsystems=list(scope_dict.get("subsystems") or []),
+        files=list(scope_dict.get("files") or []),
+    )
+    symbols_payload = payload.get("symbols") or {}
+    _ensure(isinstance(symbols_payload, Mapping), "symbols must be an object keyed by symbol name")
+    symbols: Dict[str, SymbolSummary] = {}
+    for name, summary in symbols_payload.items():
+        summary_map = _ensure_mapping(summary, f"symbol '{name}'")
+        _ensure_allowed_keys(summary_map, {"kind", "role", "evidence", "source_paths"}, f"symbol '{name}'")
+        evidence_payload = _ensure_mapping(summary_map.get("evidence") or {}, f"symbol '{name}'.evidence")
+        _ensure_allowed_keys(evidence_payload, {"fan_in", "fan_out", "annotations"}, f"symbol '{name}'.evidence")
+        symbols[name] = SymbolSummary(
+            kind=summary_map.get("kind", ""),
+            role=summary_map.get("role", ""),
+            evidence=Evidence(
+                fan_in=int(evidence_payload.get("fan_in", 0)),
+                fan_out=int(evidence_payload.get("fan_out", 0)),
+                annotations=list(evidence_payload.get("annotations") or []),
+            ),
+            source_paths=list(summary_map.get("source_paths") or []),
+        )
+    dependencies_payload = payload.get("dependencies") or []
+    _ensure(isinstance(dependencies_payload, list), "dependencies must be a list")
+    dependencies = [
+        _dependency_from_mapping(item)
+        for item in dependencies_payload
+    ]
+    decisions_payload = payload.get("decisions") or []
+    _ensure(isinstance(decisions_payload, list), "decisions must be a list")
+    decisions = [
+        _decision_from_mapping(item)
+        for item in decisions_payload
+    ]
+    open_questions = list(payload.get("open_questions") or [])
+    state = SessionState(
+        session_id=str(payload.get("session_id", "")),
+        timestamp=str(payload.get("timestamp", "")),
+        structural_version=str(payload.get("structural_version", "")),
+        scope=scope,
+        symbols=symbols,
+        confidence=str(payload.get("confidence", "")),
+        schema_version=str(payload.get("schema_version", SCHEMA_VERSION)),
+        dependencies=dependencies,
+        decisions=decisions,
+        open_questions=open_questions,
+    )
+    state.validate()
+    return state
+
+
+def session_state_to_dict(state: SessionState) -> Dict[str, Any]:
+    state.validate()
+    return {
+        "schema_version": state.schema_version,
+        "session_id": state.session_id,
+        "timestamp": state.timestamp,
+        "structural_version": state.structural_version,
+        "scope": {
+            "subsystems": list(state.scope.subsystems),
+            "files": list(state.scope.files),
+        },
+        "symbols": {
+            name: {
+                "kind": summary.kind,
+                "role": summary.role,
+                "evidence": {
+                    "fan_in": summary.evidence.fan_in,
+                    "fan_out": summary.evidence.fan_out,
+                    "annotations": list(summary.evidence.annotations),
+                },
+                "source_paths": list(summary.source_paths),
+            }
+            for name, summary in state.symbols.items()
+        },
+        "dependencies": [
+            {"src": dep.src, "relation": dep.relation, "dst": dep.dst}
+            for dep in state.dependencies
+        ],
+        "decisions": [
+            {"decision": dec.decision, "reason": dec.reason}
+            for dec in state.decisions
+        ],
+        "open_questions": list(state.open_questions),
+        "confidence": state.confidence,
+    }
+
+
+def dump_session_state(state: SessionState, path: Path) -> None:
+    payload = session_state_to_dict(state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _is_iso_timestamp(value: str) -> bool:
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure(condition: bool, message: str) -> None:
+    if not condition:
+        raise SessionStateValidationError(message)
+
+
+def _ensure_mapping(value: Any, location: str) -> Mapping[str, Any]:
+    _ensure(isinstance(value, Mapping), f"{location} must be an object")
+    return value
+
+
+def _ensure_allowed_keys(payload: Mapping[str, Any], allowed: Set[str], location: str) -> None:
+    extras = set(payload.keys()) - allowed
+    _ensure(not extras, f"{location} contains unsupported fields: {', '.join(sorted(extras))}")
+
+
+def _dependency_from_mapping(payload: Mapping[str, Any]) -> DependencyRecord:
+    mapping = _ensure_mapping(payload, "dependency entry")
+    _ensure_allowed_keys(mapping, {"src", "relation", "dst"}, "dependency entry")
+    record = DependencyRecord(
+        src=str(mapping.get("src", "")),
+        relation=str(mapping.get("relation", "")),
+        dst=str(mapping.get("dst", "")),
+    )
+    record.validate()
+    return record
+
+
+def _decision_from_mapping(payload: Mapping[str, Any]) -> DecisionRecord:
+    mapping = _ensure_mapping(payload, "decision entry")
+    _ensure_allowed_keys(mapping, {"decision", "reason"}, "decision entry")
+    record = DecisionRecord(
+        decision=str(mapping.get("decision", "")),
+        reason=str(mapping.get("reason", "")),
+    )
+    record.validate()
+    return record
+
+
+def new_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_context_history(storage_path: Optional[Path] = None) -> Dict[str, Any]:
+    target = storage_path or CONTEXT_HISTORY_FILE
+    try:
+        if not target.exists():
+            return {}
+        return json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def record_context_event(
+    symbol: str,
+    level: int,
+    status: str,
+    *,
+    storage_path: Optional[Path] = None,
+) -> None:
+    target = storage_path or CONTEXT_HISTORY_FILE
+    try:
+        history = load_context_history(target)
+        history[str(symbol)] = {
+            "symbol": symbol,
+            "level": int(level),
+            "status": status,
+            "timestamp": new_timestamp(),
+        }
+        target.write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _context_bookmark_from_mapping(entry: Mapping[str, Any]) -> Optional[ContextBookmark]:
+    try:
+        bookmark = ContextBookmark(
+            level=int(entry.get("level", 0)),
+            status=str(entry.get("status", "")) or "unknown",
+            timestamp=str(entry.get("timestamp", new_timestamp())),
+        )
+        bookmark.validate()
+        return bookmark
+    except Exception:
+        return None
+
+
+def attach_context_history(
+    state: SessionState,
+    history: Optional[Mapping[str, Any]] = None,
+    *,
+    storage_path: Optional[Path] = None,
+) -> None:
+    payload = history if history is not None else load_context_history(storage_path)
+    if not payload:
+        return
+    for name, summary in state.symbols.items():
+        if summary.context:
+            continue
+        entry = payload.get(name)
+        if isinstance(entry, Mapping):
+            bookmark = _context_bookmark_from_mapping(entry)
+            if bookmark:
+                summary.context = bookmark
+'''
+
+
+def _bootstrap_session_state_module() -> None:
+    module_path = Path(__file__).with_name("session_state.py")
+    if module_path.exists():
+        return
+    try:
+        module_path.write_text(_SESSION_STATE_TEMPLATE, encoding="utf-8")
+    except Exception:
+        pass
+
+
+_bootstrap_session_state_module()
+
+try:
+    from session_state import record_context_event
+except Exception:
+    def record_context_event(*_args, **_kwargs):
+        return None
 
 
 
@@ -71,7 +457,9 @@ EXTS = (
 
     ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".md", ".json",
 
-    ".yaml", ".yml", ".cpp", ".h", ".java", ".go", ".rs", ".sh", ".txt"
+    ".yaml", ".yml", ".cpp", ".h", ".java", ".go", ".rs", ".sh", ".txt",
+
+    ".ps1", ".psm1", ".cmd", ".bat"
 
 )
 
@@ -79,7 +467,43 @@ MIGRATIONS_DIR = "migrations"
 STRUCTURAL_VERSION_KEY = "structural_version"
 CACHE_META_KEY = "__meta__"
 STRUCTURAL_TABLES = ("symbols", "edges", "annotations")
+STRUCTURAL_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS symbols (
+    path TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    kind TEXT,
+    line_start INTEGER,
+    line_end INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_symbols_symbol ON symbols(symbol);
+CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
+
+CREATE TABLE IF NOT EXISTS edges (
+    src_path TEXT NOT NULL,
+    src_symbol TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    dst_path TEXT,
+    dst_symbol TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_edges_src_symbol ON edges(src_symbol);
+CREATE INDEX IF NOT EXISTS idx_edges_dst_symbol ON edges(dst_symbol);
+CREATE INDEX IF NOT EXISTS idx_edges_src_path ON edges(src_path);
+
+CREATE TABLE IF NOT EXISTS annotations (
+    path TEXT NOT NULL,
+    symbol TEXT,
+    tag TEXT NOT NULL,
+    line INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_symbol ON annotations(symbol);
+CREATE INDEX IF NOT EXISTS idx_annotations_path ON annotations(path);
+"""
 MAX_STRUCTURAL_LINES = 5000
+CONTEXT_LINE_CAP = 800
+CONTEXT_ALLOWED_LEVELS = {0, 1, 2, 3}
+CONTEXT_DEFAULT_LEVEL = 1
+FILE_DEP_SUMMARY_LIMIT = 25
+ROLE_PRIORITY = ("orchestrator", "bridge", "legacy", "deprecated", "temporary")
 FILE_SYMBOL = "__file__"
 ANNOTATION_TAGS = {"legacy", "bridge", "orchestrator", "deprecated", "temporary"}
 ANNOTATION_RE = re.compile(r"@quedonde:(legacy|bridge|orchestrator|deprecated|temporary)", re.IGNORECASE)
@@ -153,6 +577,8 @@ LANGUAGE_EXTENSIONS: Dict[str, Tuple[str, ...]] = {
     "json": (".json",),
     "yaml": (".yml", ".yaml"),
     "markdown": (".md",),
+    "powershell": (".ps1", ".psm1"),
+    "batch": (".cmd", ".bat"),
 }
 LANGUAGE_BY_EXTENSION: Dict[str, str] = {
     ext: language
@@ -186,6 +612,8 @@ def connect_db():
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS files USING fts5(path, content)")
 
     conn.execute("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT)")
+
+    ensure_structural_tables(conn)
 
     return conn
 
@@ -360,6 +788,31 @@ def structural_ready(conn: sqlite3.Connection) -> bool:
             _STRUCTURAL_READY = False
 
     return bool(_STRUCTURAL_READY)
+
+
+def ensure_structural_tables(conn: sqlite3.Connection) -> None:
+
+    global _STRUCTURAL_READY
+
+    if structural_ready(conn):
+
+        return
+
+    try:
+
+        conn.executescript(STRUCTURAL_SCHEMA_SQL)
+
+        mark_structural_change(conn)
+
+        conn.commit()
+
+        _STRUCTURAL_READY = None
+
+        print("[struct] initialized structural tables")
+
+    except sqlite3.Error as exc:
+
+        print(f"[struct] failed to initialize structural tables: {exc}", file=sys.stderr)
 
 
 def classify_language(path: str) -> Optional[str]:
@@ -584,6 +1037,32 @@ JS_TS_PATTERNS: List[Tuple[str, re.Pattern]] = [
 ]
 
 
+POWERSHELL_PATTERNS: List[Tuple[str, re.Pattern]] = [
+
+    (
+
+        "function",
+
+        re.compile(r"^\s*function\s+([A-Za-z_][\w\-]*)\s*(?:\(|\{)", re.IGNORECASE | re.MULTILINE),
+
+    ),
+
+    ("class", re.compile(r"^\s*class\s+([A-Za-z_][\w]*)", re.IGNORECASE | re.MULTILINE)),
+
+    (
+
+        "filter",
+
+        re.compile(r"^\s*filter\s+([A-Za-z_][\w\-]*)\s*(?:\(|\{)", re.IGNORECASE | re.MULTILINE),
+
+    ),
+
+]
+
+
+BATCH_LABEL_RE = re.compile(r"^\s*:([A-Za-z0-9_\.]+)", re.MULTILINE)
+
+
 JSON_YAML_KEY_RE = re.compile(r'"?([A-Za-z0-9_\-\. ]+)"?\s*:')
 MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
@@ -596,6 +1075,36 @@ def _extract_cpp_symbols(text: str) -> List[SymbolRecord]:
 def _extract_js_symbols(text: str) -> List[SymbolRecord]:
 
     return _regex_symbol_scan(text, JS_TS_PATTERNS)
+
+
+def _extract_powershell_symbols(text: str) -> List[SymbolRecord]:
+
+    return _regex_symbol_scan(text, POWERSHELL_PATTERNS)
+
+
+def _extract_batch_symbols(text: str) -> List[SymbolRecord]:
+
+    records: List[SymbolRecord] = []
+
+    for line_number, raw in enumerate(text.splitlines(), 1):
+
+        stripped = raw.strip()
+
+        if not stripped or stripped.startswith("::"):
+
+            continue
+
+        match = BATCH_LABEL_RE.match(stripped)
+
+        if match:
+
+            label = match.group(1)
+
+            if label:
+
+                records.append((label, "label", line_number, line_number))
+
+    return records
 
 
 def _extract_top_level_keys(text: str) -> List[SymbolRecord]:
@@ -661,6 +1170,10 @@ SYMBOL_EXTRACTORS: Dict[str, SymbolExtractor] = {
     "yaml": _extract_top_level_keys,
 
     "markdown": _extract_markdown_symbols,
+
+    "powershell": _extract_powershell_symbols,
+
+    "batch": _extract_batch_symbols,
 
 }
 
@@ -987,6 +1500,410 @@ def extract_annotations(
             annotations.append((path, symbol, tag, line_number))
 
     return annotations
+
+
+# -----------------------------
+# Structural context expansion
+# -----------------------------
+
+
+def _fetch_symbol_rows(conn: sqlite3.Connection, symbol: str) -> List[Dict[str, object]]:
+    rows = conn.execute(
+        "SELECT path, symbol, kind, line_start, line_end FROM symbols WHERE symbol=?",
+        (symbol,),
+    ).fetchall()
+    normalized: List[Dict[str, object]] = []
+    seen: Set[Tuple[str, str, str, int, int]] = set()
+    for row in rows:
+        path = row["path"]
+        name = row["symbol"]
+        kind = row["kind"] or ""
+        line_start = row["line_start"]
+        line_end = row["line_end"]
+        if not path or line_start is None or line_end is None:
+            continue
+        start = int(line_start)
+        end = int(line_end)
+        if end < start:
+            start, end = end, start
+        key = (path, name, kind, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "name": name,
+                "kind": kind,
+                "path": path,
+                "line_start": start,
+                "line_end": end,
+            }
+        )
+    return normalized
+
+
+def _filter_symbol_rows(
+    rows: List[Dict[str, object]],
+    path_filter: Optional[str],
+    kind_filter: Optional[str],
+) -> List[Dict[str, object]]:
+    filtered = rows
+    if path_filter:
+        filtered = [row for row in filtered if fnmatch.fnmatch(row["path"], path_filter)]
+    if kind_filter:
+        filtered = [row for row in filtered if row.get("kind") == kind_filter]
+    return filtered
+
+
+def _classify_role(tags: List[str]) -> str:
+    for candidate in ROLE_PRIORITY:
+        if candidate in tags:
+            return candidate
+    return "unknown"
+
+
+def _collect_annotations(
+    conn: sqlite3.Connection,
+    path: str,
+    symbol: Optional[str] = None,
+) -> List[str]:
+    if symbol:
+        rows = conn.execute(
+            "SELECT DISTINCT tag FROM annotations WHERE path=? AND (symbol=? OR symbol IS NULL) ORDER BY tag",
+            (path, symbol),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT tag FROM annotations WHERE path=? AND symbol IS NULL ORDER BY tag",
+            (path,),
+        ).fetchall()
+    return [row["tag"] for row in rows if row["tag"]]
+
+
+def _build_symbol_section(row: Dict[str, object], annotations: Optional[List[str]] = None) -> Dict[str, object]:
+    start = int(row["line_start"])
+    end = int(row["line_end"])
+    span = max(0, end - start + 1)
+    tags = annotations or []
+    section = {
+        "name": row["name"],
+        "kind": row.get("kind"),
+        "path": row["path"],
+        "line_start": start,
+        "line_end": end,
+        "span": span,
+        "role": _classify_role(tags),
+    }
+    if tags:
+        section["annotations"] = tags
+    return section
+
+
+def _infer_parent_from_ranges(
+    conn: sqlite3.Connection,
+    definition: Dict[str, object],
+) -> Tuple[Optional[Dict[str, object]], bool]:
+    rows = conn.execute(
+        "SELECT symbol, kind, line_start, line_end FROM symbols WHERE path=?",
+        (definition["path"],),
+    ).fetchall()
+    best: Optional[Dict[str, object]] = None
+    best_span: Optional[int] = None
+    duplicate_span = False
+    child_start = definition["line_start"]
+    child_end = definition["line_end"]
+    for row in rows:
+        name = row["symbol"]
+        kind = row["kind"] or ""
+        start = row["line_start"]
+        end = row["line_end"]
+        if start is None or end is None:
+            continue
+        start_i = int(start)
+        end_i = int(end)
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        if start_i > child_start or end_i < child_end:
+            continue
+        if (
+            name == definition["name"]
+            and start_i == child_start
+            and end_i == child_end
+        ):
+            continue
+        span = end_i - start_i
+        if best_span is None or span < best_span:
+            best_span = span
+            best = {
+                "name": name,
+                "kind": kind,
+                "path": definition["path"],
+                "line_start": start_i,
+                "line_end": end_i,
+            }
+            duplicate_span = False
+        elif span == best_span and best is not None:
+            duplicate_span = True
+    return best, duplicate_span
+
+
+def _resolve_parent_container(
+    conn: sqlite3.Connection,
+    definition: Dict[str, object],
+) -> Dict[str, object]:
+    info: Dict[str, object] = {
+        "status": "missing",
+        "container": None,
+        "warnings": [],
+        "ownership_inferred": False,
+    }
+    owner_rows = conn.execute(
+        "SELECT src_symbol FROM edges WHERE relation='owns' AND dst_symbol=? AND src_path=?",
+        (definition["name"], definition["path"]),
+    ).fetchall()
+    owner_names = sorted({row["src_symbol"] for row in owner_rows if row["src_symbol"]})
+    if owner_names:
+        if len(owner_names) > 1:
+            info["status"] = "ambiguous"
+            info["diagnostics"] = {"owners": owner_names}
+            return info
+        parent_rows = [row for row in _fetch_symbol_rows(conn, owner_names[0]) if row["path"] == definition["path"]]
+        if not parent_rows:
+            info["status"] = "partial"
+            info["warnings"].append("parent definition missing; falling back to child span")
+            info["container"] = {
+                "name": owner_names[0],
+                "kind": "unknown",
+                "path": definition["path"],
+                "line_start": definition["line_start"],
+                "line_end": definition["line_end"],
+            }
+            return info
+        if len(parent_rows) > 1:
+            info["status"] = "ambiguous"
+            info["diagnostics"] = {"owners": owner_names}
+            return info
+        info["status"] = "ok"
+        info["container"] = parent_rows[0]
+        return info
+
+    inferred, duplicate_span = _infer_parent_from_ranges(conn, definition)
+    if inferred:
+        info["status"] = "ok"
+        info["ownership_inferred"] = True
+        if duplicate_span:
+            info["warnings"].append("multiple enclosing spans detected; chose smallest envelope")
+        info["container"] = inferred
+        return info
+
+    return info
+
+
+def _read_symbol_body(
+    section: Dict[str, object],
+    *,
+    allow_truncate: bool,
+) -> Tuple[Optional[str], bool, Dict[str, object]]:
+    path = section["path"]
+    start = int(section["line_start"])
+    end = int(section["line_end"])
+    total_lines = max(0, end - start + 1)
+    try:
+        with open(path, "r", errors="ignore") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        return None, False, {"status": "io_error", "message": str(exc)}
+
+    if not lines:
+        return "", False, {"status": "ok", "line_count": 0, "total_lines": 0}
+
+    max_index = len(lines)
+    start_idx = max(1, start)
+    end_idx = min(max_index, end)
+    if end_idx < start_idx:
+        end_idx = start_idx
+    snippet = lines[start_idx - 1 : end_idx]
+    truncated = False
+    if len(snippet) > CONTEXT_LINE_CAP:
+        if not allow_truncate:
+            return None, False, {
+                "status": "truncation_required",
+                "line_count": len(snippet),
+                "cap": CONTEXT_LINE_CAP,
+            }
+        truncated = True
+        snippet = snippet[:CONTEXT_LINE_CAP]
+    text = "".join(snippet).rstrip("\n")
+    return text, truncated, {
+        "status": "ok",
+        "line_count": len(snippet),
+        "total_lines": total_lines,
+        "cap": CONTEXT_LINE_CAP,
+    }
+
+
+def _collect_parent_outline(
+    conn: sqlite3.Connection,
+    container: Dict[str, object],
+    *,
+    limit: int = 64,
+) -> List[Dict[str, object]]:
+    rows = conn.execute(
+        "SELECT dst_symbol FROM edges WHERE relation='owns' AND src_symbol=? AND src_path=? ORDER BY dst_symbol LIMIT ?",
+        (container["name"], container["path"], limit),
+    ).fetchall()
+    outline: List[Dict[str, object]] = []
+    seen: Set[str] = set()
+    for row in rows:
+        child = row["dst_symbol"]
+        if not child or child in seen:
+            continue
+        seen.add(child)
+        child_rows = [entry for entry in _fetch_symbol_rows(conn, child) if entry["path"] == container["path"]]
+        if child_rows:
+            outline.append(_build_symbol_section(child_rows[0]))
+        else:
+            outline.append({"name": child, "kind": "unknown"})
+    return outline
+
+
+def _summarize_file_context(conn: sqlite3.Connection, path: str) -> Dict[str, object]:
+    fan_in = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE dst_path=?",
+        (path,),
+    ).fetchone()[0]
+    fan_out = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE src_path=?",
+        (path,),
+    ).fetchone()[0]
+    deps = conn.execute(
+        """
+        SELECT DISTINCT dst_path
+        FROM edges
+        WHERE src_path=? AND dst_path IS NOT NULL AND dst_path != ?
+        ORDER BY dst_path
+        LIMIT ?
+        """,
+        (path, path, FILE_DEP_SUMMARY_LIMIT),
+    ).fetchall()
+    dependencies = [row["dst_path"] for row in deps if row["dst_path"]]
+    annotations = _collect_annotations(conn, path, symbol=None)
+    return {
+        "path": path,
+        "fan_in": fan_in,
+        "fan_out": fan_out,
+        "dependencies": dependencies,
+        "annotations": annotations,
+        "role": _classify_role(annotations),
+    }
+
+
+def resolve_symbol_context(
+    conn: sqlite3.Connection,
+    symbol: str,
+    *,
+    level: int = CONTEXT_DEFAULT_LEVEL,
+    path_filter: Optional[str] = None,
+    kind_filter: Optional[str] = None,
+    allow_truncate: bool = False,
+) -> Dict[str, object]:
+    requested_level = level if level in CONTEXT_ALLOWED_LEVELS else CONTEXT_DEFAULT_LEVEL
+    result: Dict[str, object] = {
+        "symbol": symbol,
+        "level": requested_level,
+        "status": "ok",
+        "sections": {},
+    }
+    diagnostics: Dict[str, object] = {}
+    warnings: List[str] = []
+
+    rows = _fetch_symbol_rows(conn, symbol)
+    if not rows:
+        result["status"] = "not_found"
+        diagnostics["reason"] = "symbol not indexed in structural tables"
+        result["diagnostics"] = diagnostics
+        return result
+
+    filtered = _filter_symbol_rows(rows, path_filter, kind_filter)
+    if filtered:
+        rows = filtered
+    elif path_filter or kind_filter:
+        result["status"] = "not_found"
+        diagnostics["reason"] = "no definitions matched provided filters"
+        diagnostics["candidates"] = rows
+        result["diagnostics"] = diagnostics
+        return result
+
+    if len(rows) > 1:
+        result["status"] = "ambiguous"
+        diagnostics["reason"] = "multiple definitions detected"
+        diagnostics["candidates"] = rows
+        result["diagnostics"] = diagnostics
+        return result
+
+    definition = rows[0]
+    symbol_annotations = _collect_annotations(conn, definition["path"], definition["name"])
+    symbol_section = _build_symbol_section(definition, annotations=symbol_annotations)
+    result["sections"]["symbol"] = symbol_section
+
+    parent_info = _resolve_parent_container(conn, definition)
+    if parent_info.get("status") == "ambiguous":
+        result["status"] = "ambiguous"
+        diagnostics["reason"] = "ambiguous parent containment"
+        diagnostics.update(parent_info.get("diagnostics", {}))
+        result["diagnostics"] = diagnostics
+        return result
+
+    if parent_info.get("warnings"):
+        warnings.extend(parent_info["warnings"])
+
+    container = parent_info.get("container")
+    if container:
+        container_annotations = _collect_annotations(conn, container["path"], container["name"])
+        container_section = _build_symbol_section(container, annotations=container_annotations)
+        container_section["ownership_inferred"] = parent_info.get("ownership_inferred", False)
+        result["sections"]["container"] = container_section
+
+    if requested_level >= 1:
+        context_text, truncated, context_meta = _read_symbol_body(symbol_section, allow_truncate=allow_truncate)
+        if context_meta.get("status") != "ok":
+            result["status"] = context_meta.get("status", "error")
+            diagnostics["context_block"] = context_meta
+            if diagnostics:
+                result["diagnostics"] = diagnostics
+            if warnings:
+                result["warnings"] = warnings
+            return result
+        result["sections"]["context_block"] = {
+            "text": context_text or "",
+            "truncated": truncated,
+            "line_count": context_meta.get("line_count", 0),
+            "total_lines": context_meta.get("total_lines", context_meta.get("line_count", 0)),
+        }
+        if truncated:
+            warnings.append(
+                f"context truncated to {CONTEXT_LINE_CAP} line(s); original span {context_meta.get('total_lines')}"
+            )
+
+    if requested_level >= 2:
+        if container:
+            outline = _collect_parent_outline(conn, container)
+            if outline:
+                result["sections"]["parent_outline"] = outline
+            else:
+                warnings.append("parent outline unavailable for requested level")
+        else:
+            warnings.append("no parent container available for level 2 outline")
+
+    if requested_level >= 3:
+        result["sections"]["file_summary"] = _summarize_file_context(conn, definition["path"])
+
+    if diagnostics:
+        result["diagnostics"] = diagnostics
+    if warnings:
+        result["warnings"] = warnings
+
+    return result
 
 
 def clear_structural_records(conn: sqlite3.Connection, path: str) -> None:
@@ -2129,6 +3046,182 @@ def _parse_structural_cli_args(
 
     return symbol, json_flag, paths_only, context, limit, None
 
+
+def _parse_context_cli_args(
+    args: List[str],
+) -> Tuple[Optional[str], Dict[str, object], Optional[str]]:
+    options: Dict[str, object] = {
+        "json": False,
+        "level": CONTEXT_DEFAULT_LEVEL,
+        "path_filter": None,
+        "kind_filter": None,
+        "allow_truncate": False,
+    }
+    symbol_parts: List[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--json":
+            options["json"] = True
+        elif arg == "--level":
+            if i + 1 >= len(args):
+                return None, options, "Invalid --level usage"
+            try:
+                level_value = int(args[i + 1])
+            except ValueError:
+                return None, options, "Invalid --level value"
+            options["level"] = level_value if level_value in CONTEXT_ALLOWED_LEVELS else CONTEXT_DEFAULT_LEVEL
+            i += 1
+        elif arg == "--path":
+            if i + 1 >= len(args):
+                return None, options, "Invalid --path usage"
+            options["path_filter"] = args[i + 1]
+            i += 1
+        elif arg == "--kind":
+            if i + 1 >= len(args):
+                return None, options, "Invalid --kind usage"
+            options["kind_filter"] = args[i + 1]
+            i += 1
+        elif arg == "--allow-truncate":
+            options["allow_truncate"] = True
+        else:
+            symbol_parts.append(arg)
+        i += 1
+
+    symbol = " ".join(symbol_parts).strip()
+    return symbol, options, None
+
+
+def _handle_context_cli(conn: sqlite3.Connection, argv: List[str]) -> None:
+    symbol, options, error = _parse_context_cli_args(argv)
+    if error:
+        print(error, file=sys.stderr)
+        return
+    if not symbol:
+        print(
+            "Usage: python quedonde.py context [--json] [--level N] [--path GLOB] [--kind KIND] [--allow-truncate] <symbol>",
+            file=sys.stderr,
+        )
+        return
+
+    response = resolve_symbol_context(
+        conn,
+        symbol,
+        level=int(options["level"]),
+        path_filter=options.get("path_filter"),
+        kind_filter=options.get("kind_filter"),
+        allow_truncate=bool(options.get("allow_truncate")),
+    )
+
+    try:
+        record_context_event(symbol, response.get("level", options["level"]), response.get("status", "error"))
+    except Exception:
+        pass
+
+    if options.get("json"):
+        print(json.dumps(response, indent=2))
+        return
+
+    render_context_cli(response)
+
+
+def _format_line_range(section: Dict[str, object]) -> Optional[str]:
+    start = section.get("line_start")
+    end = section.get("line_end")
+    if start is None:
+        return None
+    if end is None or end == start:
+        return str(start)
+    return f"{start}-{end}"
+
+
+def _print_context_metadata(title: str, section: Dict[str, object]) -> None:
+    print(title)
+    print(f"- name: {section.get('name')}")
+    if section.get("kind"):
+        print(f"- kind: {section.get('kind')}")
+    if section.get("role"):
+        print(f"- role: {section.get('role')}")
+    if section.get("path"):
+        print(f"- path: {section.get('path')}")
+    line_segment = _format_line_range(section)
+    if line_segment:
+        print(f"- lines: {line_segment}")
+    if section.get("span"):
+        print(f"- span: {section.get('span')} line(s)")
+    if section.get("ownership_inferred"):
+        print("- ownership_inferred: True")
+    annotations = section.get("annotations")
+    if isinstance(annotations, list) and annotations:
+        print(f"- annotations: {', '.join(annotations)}")
+
+
+def _print_context_block(block: Dict[str, object]) -> None:
+    print("CONTEXT BLOCK")
+    if block.get("truncated"):
+        print("- truncated: True")
+    print("- lines: {}".format(block.get("line_count", 0)))
+    print("```")
+    print(block.get("text", ""))
+    print("```")
+
+
+def _print_file_summary(summary: Dict[str, object]) -> None:
+    print("FILE SUMMARY")
+    print(f"- path: {summary.get('path')}")
+    print(f"- role: {summary.get('role')}")
+    print(f"- fan_in: {summary.get('fan_in')}")
+    print(f"- fan_out: {summary.get('fan_out')}")
+    dependencies = summary.get("dependencies") or []
+    if dependencies:
+        print(f"- dependencies ({len(dependencies)}):")
+        for dep in dependencies:
+            print(f"  - {dep}")
+    annotations = summary.get("annotations") or []
+    if annotations:
+        print(f"- annotations: {', '.join(annotations)}")
+
+
+def render_context_cli(payload: Dict[str, object]) -> None:
+    print(
+        f"[context] symbol={payload.get('symbol')} level={payload.get('level')} status={payload.get('status')}"
+    )
+    sections = payload.get("sections") if isinstance(payload, dict) else None
+    if isinstance(sections, dict):
+        symbol_section = sections.get("symbol")
+        if isinstance(symbol_section, dict):
+            _print_context_metadata("SYMBOL", symbol_section)
+        container_section = sections.get("container")
+        if isinstance(container_section, dict):
+            _print_context_metadata("CONTAINER", container_section)
+        context_block = sections.get("context_block")
+        if isinstance(context_block, dict):
+            _print_context_block(context_block)
+        parent_outline = sections.get("parent_outline")
+        if isinstance(parent_outline, list):
+            print("PARENT OUTLINE")
+            for entry in parent_outline:
+                name = entry.get("name") if isinstance(entry, dict) else entry
+                kind = entry.get("kind") if isinstance(entry, dict) else None
+                if kind:
+                    print(f"- {name} [{kind}]")
+                else:
+                    print(f"- {name}")
+        file_summary = sections.get("file_summary")
+        if isinstance(file_summary, dict):
+            _print_file_summary(file_summary)
+
+    warnings = payload.get("warnings") if isinstance(payload, dict) else None
+    if isinstance(warnings, list) and warnings:
+        print("WARNINGS")
+        for note in warnings:
+            print(f"- {note}")
+
+    diagnostics = payload.get("diagnostics") if isinstance(payload, dict) else None
+    if diagnostics:
+        print("DIAGNOSTICS")
+        print(json.dumps(diagnostics, indent=2))
+
 # -----------------------------
 # Diagnostics
 # -----------------------------
@@ -2770,341 +3863,6 @@ def search_repo(
 
 
 # -----------------------------
-# Session state helpers
-# -----------------------------
-
-
-def _build_session_symbol_summary(
-    conn: sqlite3.Connection,
-    symbol: str,
-    *,
-    dependency_limit: int = 25,
-) -> Tuple[SymbolSummary, List[DependencyRecord]]:
-    row = conn.execute(
-        "SELECT kind FROM symbols WHERE symbol=? ORDER BY path LIMIT 1",
-        (symbol,),
-    ).fetchone()
-    if not row:
-        raise SessionStateValidationError(f"symbol '{symbol}' not found in structural tables")
-
-    path_rows = conn.execute(
-        "SELECT DISTINCT path FROM symbols WHERE symbol=? AND path IS NOT NULL ORDER BY path LIMIT 5",
-        (symbol,),
-    ).fetchall()
-    source_paths = [entry[0] for entry in path_rows if entry[0]]
-    if not source_paths:
-        raise SessionStateValidationError(f"symbol '{symbol}' is missing definition paths")
-
-    annotations = [
-        entry["tag"]
-        for entry in conn.execute(
-            "SELECT DISTINCT tag FROM annotations WHERE symbol=? ORDER BY tag",
-            (symbol,),
-        ).fetchall()
-    ]
-    role = annotations[0] if annotations else "unspecified"
-    fan_in = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE dst_symbol=?",
-        (symbol,),
-    ).fetchone()[0]
-    fan_out = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE src_symbol=?",
-        (symbol,),
-    ).fetchone()[0]
-    summary = SymbolSummary(
-        kind=row["kind"],
-        role=role,
-        evidence=Evidence(fan_in=int(fan_in), fan_out=int(fan_out), annotations=annotations),
-        source_paths=source_paths,
-    )
-
-    dep_rows = conn.execute(
-        """
-        SELECT relation, dst_symbol, dst_path
-        FROM edges
-        WHERE src_symbol=?
-            AND relation IN ('calls', 'imports', 'includes', 'references')
-        ORDER BY relation, dst_symbol, dst_path
-        LIMIT ?
-        """,
-        (symbol, dependency_limit),
-    ).fetchall()
-    seen: Set[Tuple[str, str, str]] = set()
-    dependencies: List[DependencyRecord] = []
-    for dep in dep_rows:
-        dst = dep["dst_symbol"] or dep["dst_path"]
-        if not dst:
-            continue
-        key = (symbol, dep["relation"], dst)
-        if key in seen:
-            continue
-        seen.add(key)
-        record = DependencyRecord(src=symbol, relation=dep["relation"], dst=dst)
-        record.validate()
-        dependencies.append(record)
-
-    summary.validate(symbol)
-    return summary, dependencies
-
-
-def _parse_decision_entry(text: str) -> DecisionRecord:
-    if "::" not in text:
-        raise SessionStateValidationError("decisions must use 'decision::reason' format")
-    decision, reason = text.split("::", 1)
-    record = DecisionRecord(decision=decision.strip(), reason=reason.strip())
-    record.validate()
-    return record
-
-
-def _write_session_output(
-    payload: Dict[str, object],
-    *,
-    path: Path,
-    append: bool,
-    force: bool,
-) -> None:
-    state_json = json.dumps(payload, indent=2) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if append and path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(existing, list):
-            existing.append(payload)
-        else:
-            existing = [existing, payload]
-        path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-        print(f"[session] appended checkpoint to {path}")
-        return
-
-    if path.exists() and not force:
-        raise SessionStateValidationError(
-            f"Refusing to overwrite existing checkpoint {path}; use --force or --append"
-        )
-    path.write_text(state_json, encoding="utf-8")
-    print(f"[session] wrote checkpoint to {path}")
-
-
-def _revalidate_session_state(
-    conn: sqlite3.Connection,
-    state: SessionState,
-    *,
-    verify_paths: bool = True,
-) -> List[str]:
-    warnings: List[str] = []
-    if not structural_ready(conn):
-        return [
-            "structural tables unavailable; run 'python quedonde.py migrate' + 'index' before verifying",
-        ]
-
-    current_version = get_structural_version(conn)
-    if current_version != state.structural_version:
-        warnings.append(
-            f"structural version drift: checkpoint={state.structural_version} current={current_version}"
-        )
-
-    for symbol_name, summary in state.symbols.items():
-        row = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE symbol=?",
-            (symbol_name,),
-        ).fetchone()
-        if not row or int(row[0]) == 0:
-            warnings.append(f"symbol '{symbol_name}' missing from structural tables")
-            continue
-
-        fan_in = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE dst_symbol=?",
-            (symbol_name,),
-        ).fetchone()[0]
-        fan_out = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE src_symbol=?",
-            (symbol_name,),
-        ).fetchone()[0]
-        if int(fan_in) != summary.evidence.fan_in:
-            warnings.append(
-                f"symbol '{symbol_name}' fan_in mismatch (checkpoint={summary.evidence.fan_in}, current={fan_in})"
-            )
-        if int(fan_out) != summary.evidence.fan_out:
-            warnings.append(
-                f"symbol '{symbol_name}' fan_out mismatch (checkpoint={summary.evidence.fan_out}, current={fan_out})"
-            )
-
-        if verify_paths and summary.source_paths:
-            missing_paths = [
-                path
-                for path in summary.source_paths
-                if not conn.execute(
-                    "SELECT 1 FROM symbols WHERE symbol=? AND path=? LIMIT 1",
-                    (symbol_name, path),
-                ).fetchone()
-            ]
-            if missing_paths:
-                warnings.append(
-                    f"symbol '{symbol_name}' missing previously recorded path(s): {', '.join(missing_paths)}"
-                )
-
-    return warnings
-
-
-def _print_session_state_summary(state: SessionState) -> None:
-    print(f"Session: {state.session_id} (confidence={state.confidence})")
-    print(f"Timestamp: {state.timestamp}")
-    print(f"Structural version: {state.structural_version}")
-    print("Subsystems: " + ", ".join(state.scope.subsystems))
-    print("Files: " + ", ".join(state.scope.files))
-    print("Symbols:")
-    for name, summary in state.symbols.items():
-        evidence = summary.evidence
-        annotations = ", ".join(summary.evidence.annotations) if summary.evidence.annotations else "none"
-        print(
-            f"  - {name} ({summary.kind}, role={summary.role}) fan_in={evidence.fan_in} "
-            f"fan_out={evidence.fan_out} annotations={annotations}"
-        )
-    if state.dependencies:
-        print("Dependencies:")
-        for dep in state.dependencies:
-            print(f"  - {dep.src} --{dep.relation}--> {dep.dst}")
-    if state.decisions:
-        print("Decisions:")
-        for dec in state.decisions:
-            print(f"  - {dec.decision} (reason: {dec.reason})")
-    if state.open_questions:
-        print("Open questions:")
-        for question in state.open_questions:
-            print(f"  - {question}")
-
-
-def session_dump_cli(conn: sqlite3.Connection, argv: List[str]) -> None:
-    parser = argparse.ArgumentParser(prog="python quedonde.py session dump")
-    parser.add_argument("--session-id", required=True)
-    parser.add_argument("--subsystem", dest="subsystems", action="append", required=True, help="Scope subsystem (repeat)")
-    parser.add_argument("--file", dest="files", action="append", required=True, help="Scope file path (repeat)")
-    parser.add_argument("--symbol", dest="symbols", action="append", required=True, help="Symbol to summarize (repeat)")
-    parser.add_argument("--confidence", choices=sorted(CONFIDENCE_LEVELS), default="medium")
-    parser.add_argument("--decision", dest="decisions", action="append", help="Decision entry formatted as 'decision::reason'")
-    parser.add_argument("--question", dest="questions", action="append", help="Open question (repeat)")
-    parser.add_argument("--output", default="quedonde_session_state.json", help="Destination file")
-    parser.add_argument("--append", action="store_true", help="Append to an existing JSON array of checkpoints")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing file when not using --append")
-    parser.add_argument("--deps-limit", type=int, default=25, help="Max dependency edges per symbol")
-    args = parser.parse_args(argv)
-
-    if not structural_available(conn):
-        return
-
-    try:
-        scope = SessionScope(subsystems=args.subsystems, files=args.files)
-        scope.validate()
-        symbols: Dict[str, SymbolSummary] = {}
-        dependencies: List[DependencyRecord] = []
-        for symbol in args.symbols:
-            summary, deps = _build_session_symbol_summary(
-                conn,
-                symbol,
-                dependency_limit=max(1, args.deps_limit),
-            )
-            symbols[symbol] = summary
-            dependencies.extend(deps)
-
-        decisions = [
-            _parse_decision_entry(text)
-            for text in (args.decisions or [])
-        ]
-        open_questions = list(args.questions or [])
-
-        state = SessionState(
-            session_id=args.session_id,
-            timestamp=new_timestamp(),
-            structural_version=get_structural_version(conn),
-            scope=scope,
-            symbols=symbols,
-            confidence=args.confidence,
-            dependencies=dependencies,
-            decisions=decisions,
-            open_questions=open_questions,
-        )
-        payload = session_state_to_dict(state)
-        _write_session_output(
-            payload,
-            path=Path(args.output),
-            append=args.append,
-            force=args.force,
-        )
-    except SessionStateValidationError as exc:
-        print(f"[session] {exc}", file=sys.stderr)
-
-
-def _load_session_payload(path: Path, session_id: Optional[str]) -> Dict[str, object]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(data, list):
-        if not session_id:
-            raise SessionStateValidationError("--session-id is required when loading from an array")
-        for item in data:
-            if item.get("session_id") == session_id:
-                return item
-        raise SessionStateValidationError(f"session_id '{session_id}' not found in {path}")
-    if session_id and data.get("session_id") != session_id:
-        raise SessionStateValidationError(
-            f"Checkpoint session_id {data.get('session_id')} does not match requested {session_id}"
-        )
-    return data
-
-
-def session_resume_cli(conn: sqlite3.Connection, argv: List[str]) -> None:
-    parser = argparse.ArgumentParser(prog="python quedonde.py session resume")
-    parser.add_argument("--input", default="quedonde_session_state.json", help="Checkpoint file to read")
-    parser.add_argument("--session-id", help="Specific session_id inside the file")
-    parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of summary")
-    parser.add_argument(
-        "--skip-verify",
-        action="store_true",
-        help="Skip structural drift checks when resuming",
-    )
-    args = parser.parse_args(argv)
-
-    path = Path(args.input)
-    if not path.exists():
-        print(f"[session] checkpoint file {path} not found", file=sys.stderr)
-        return
-
-    try:
-        payload = _load_session_payload(path, args.session_id)
-        state = session_state_from_dict(payload)
-    except SessionStateValidationError as exc:
-        print(f"[session] {exc}", file=sys.stderr)
-        return
-    except json.JSONDecodeError as exc:
-        print(f"[session] failed to parse {path}: {exc}", file=sys.stderr)
-        return
-
-    if not args.skip_verify:
-        warnings = _revalidate_session_state(conn, state)
-        if warnings:
-            print("[session] revalidation warnings detected:", file=sys.stderr)
-            for message in warnings:
-                print(f"  - {message}", file=sys.stderr)
-        else:
-            print("[session] checkpoint matches current structural state", file=sys.stderr)
-
-    if args.json:
-        print(json.dumps(session_state_to_dict(state), indent=2))
-    else:
-        _print_session_state_summary(state)
-
-
-def session_cli(conn: sqlite3.Connection, argv: List[str]) -> None:
-    if not argv:
-        print("Usage: python quedonde.py session <dump|resume> [options]", file=sys.stderr)
-        return
-    subcommand = argv[0]
-    if subcommand == "dump":
-        session_dump_cli(conn, argv[1:])
-    elif subcommand == "resume":
-        session_resume_cli(conn, argv[1:])
-    else:
-        print(f"[session] unknown subcommand '{subcommand}'", file=sys.stderr)
-
-
-
-# -----------------------------
 
 # CLI
 
@@ -3180,12 +3938,6 @@ def main():
 
         return
 
-    if sys.argv[1] == "session":
-
-        session_cli(conn, sys.argv[2:])
-
-        return
-
     if sys.argv[1] == "ask":
 
         json_flag = "--json" in sys.argv[2:]
@@ -3209,6 +3961,12 @@ def main():
             return
 
         render_structural_cli_response(response)
+
+        return
+
+    if sys.argv[1] == "context":
+
+        _handle_context_cli(conn, sys.argv[2:])
 
         return
 

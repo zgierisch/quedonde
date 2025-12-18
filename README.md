@@ -14,7 +14,7 @@ Single-file, dependency-free code search with deterministic structural answers. 
 
 ## Installation
 Pick whichever option fits your workflow:
-- **Standalone download** – copy `quedonde.py` into your repository root (or clone this repo and symlink the script). The CLI stores its SQLite/cache files next to wherever the script lives.
+- **Standalone download** – copy `quedonde.py` into your repository root (or clone this repo and symlink the script). On the next `index`/`session` command the CLI auto-creates `session_state.py` beside the script if it’s missing, so the checkpoint pipeline still works without copying extra files. The SQLite/cache files live next to wherever the script runs.
 - **Virtual environment** – create a venv in the repo (`python -m venv .venv && .\.venv\Scripts\activate`) and run `python quedonde.py ...` so dependencies stay isolated.
 - **Editable install (optional)** – if you prefer `pip install -e .`, add this repo to your workspace and reference `quedonde` as a module (`python -m quedonde ...`). The script is self-contained, so no extra dependencies are required.
 
@@ -84,6 +84,9 @@ python quedonde.py callers --json update_structural_data
 python quedonde.py deps --limit 25 classify_intent
 python quedonde.py explain structural_ready
 
+# Containment-aware context
+python quedonde.py context update_structural_data --level 1
+
 # Intent-driven natural language
 python quedonde.py ask "who calls update_structural_data"
 python quedonde.py ask --json "explain structural_ready"
@@ -95,6 +98,31 @@ What each command returns:
 - `deps` – outbound relations (`calls`, `imports`, `includes`, `references`).
 - `explain` – bundles definitions, callers, dependencies, and annotations.
 - `ask` – classifies a natural-language question, invokes the correct handler, and prints a narrative plus structured payload.
+- `context` – emits structural context blocks for a symbol at Level 0-3 (definition only, owning function, parent outline, file summary) with optional `--path`, `--kind`, `--level`, and `--json` flags. See the dedicated section below for level-by-level details.
+
+### Context blocks
+`context` composes increasingly broader structural snippets so you can keep expanding outward without retyping prior commands.
+
+| Level | Scope | Default content | Use it when |
+| --- | --- | --- | --- |
+| 0 | Definition span | Exact symbol definition plus annotations | You only need the declaration and immediate metadata |
+| 1 | Owning construct | Wrapping function/class including signature and body header | You are reviewing how the symbol behaves inside its parent |
+| 2 | Parent outline | Parent symbol headers plus sibling names and relations | You want to understand nearby collaborators before diving into the whole file |
+| 3 | File summary | File-level docstring, imports, and top symbols (caps at 800 lines) | You are ready for a high-level synopsis before reading source |
+
+Minimum viable usage keeps parameters light:
+
+```powershell
+python quedonde.py context update_structural_data --level 1
+```
+
+Add filters as needed—`--path` narrows to specific files/globs, `--kind` limits structural types, and `--json` makes the output machine-readable:
+
+```powershell
+python quedonde.py context update_structural_data --level 2 --path "src/**/*.py" --kind function --json
+```
+
+Each invocation records a bookmark in `.quedonde_context_history.json`, letting session checkpoints stitch the latest expansion back into future resumes.
 
 If the tables go stale (or you cloned a repo without the DB), rerun `index`. The CLI warns on `stderr` and returns an empty list until fresh data exists.
 
@@ -173,17 +201,28 @@ python quedonde.py session resume --input checkpoints/climate.json --session-id 
 python quedonde.py session resume --input checkpoints/climate.json --skip-verify
 ```
 
+**Create or append checkpoints**
 1. **Scope the session** – repeat `--subsystem`, `--file`, and `--symbol` to define what you touched. The CLI collects fan-in/out counts, annotations, and dependent edges directly from the SQLite structural tables.
-2. **Capture narrative context** – add `--decision` entries in `decision::reason` format and `--question` flags for any open issues so they stay tied to the evidence.
-3. **Store locally** – use `--output` (plus `--append` or `--force`) to control how checkpoints land under `checkpoints/` or another ignored folder.
-4. **Rehydrate later** – `session resume` revalidates the snapshot against the live database and prints either JSON (`--json`) or a human-readable digest. Investigate any warnings before trusting the data.
+2. **Capture narrative context** – add `--decision` entries in `decision::reason` format and `--question` flags for any open issues so they stay tethered to the structural evidence.
+3. **Store locally** – use `--output` with `--append` or `--force` to control how checkpoints land under `checkpoints/` or another ignored folder.
+
+**Resume & maintain**
+1. **Rehydrate snapshots** – `session resume` revalidates the snapshot against the live database and prints either JSON (`--json`) or a human-readable digest. Investigate any warnings before trusting the data.
+2. **Fold in latest context** – `session resume` automatically merges the newest context bookmark for each symbol so you continue exactly where the prior investigation stopped.
+3. **Gate drift** – only pass `--skip-verify` in rehearsed CI workflows; during manual reviews keep verification on so schema and dependency drift surface immediately.
+
+### Context history integration
+Every `quedonde context` invocation records the symbol, requested level, applied filters, and timestamp inside `.quedonde_context_history.json`. When you later run `session resume`, that history attaches to each symbol block so operators and copilots can see how far an investigation already expanded without digging through terminal logs.
 
 ### Guardrails & limits
-- Source provenance: every symbol stores up to five `source_paths`; if any disappear, `session resume` emits a warning so you can re-index or adjust scope.
-- Drift detection: structural version mismatches, fan-in/out deltas, and missing symbols surface on `stderr`. Only pass `--skip-verify` for rehearsed CI workflows.
-- Data hygiene: validators reject raw code snippets longer than 120 characters, forcing you to store reasoning rather than source dumps.
-- Local storage: checkpoints stay in ignored directories, so promote them manually only if your security model allows sharing.
-- Schema alignment: the format is defined in [documentation/specs/session_state_checkpointing.md](documentation/specs/session_state_checkpointing.md); bump the schema version and regenerate checkpoints whenever that file changes.
+| Topic | Details | Action |
+| --- | --- | --- |
+| Source provenance | Each symbol stores up to five `source_paths`; missing files trigger warnings during `session resume`. | Re-run `python quedonde.py index` or narrow `--file` scopes until the paths exist again. |
+| Drift detection | Structural version mismatches, fan-in/out deltas, and missing symbols surface on `stderr`. | Keep verification enabled; reserve `--skip-verify` for scripted CI where drift is expected. |
+| Data hygiene | Validators reject raw code snippets longer than 120 characters to keep checkpoints reasoning-first. | Summarize long code in prose before invoking `session dump`. |
+| Local storage | Checkpoints stay in ignored directories by default. | Promote files manually if your security model allows sharing beyond the repo. |
+| Schema alignment | The full format lives in [documentation/specs/session_state_checkpointing.md](documentation/specs/session_state_checkpointing.md). | Bump the schema version and regenerate checkpoints whenever the spec changes. |
+| Context bookmarks | `.quedonde_context_history.json` lists which symbols/levels were expanded most recently. | Run `quedonde context` before `session dump`/`resume` to keep the latest exploration stitched into the checkpoint. |
 
 ### Batch automation
 Define multiple sessions in a small JSON plan and let `scripts/session_checkpoint.py` fan them out:
